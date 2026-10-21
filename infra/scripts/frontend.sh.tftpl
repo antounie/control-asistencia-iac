@@ -1,0 +1,57 @@
+#!/bin/bash
+# Script de arranque del FRONTEND. Lo ejecuta cloud-init como root, una sola vez.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export HOME=/root
+cd /tmp
+
+echo "== 1. Esperando a que la IP elastica quede asociada =="
+until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${frontend_ip}" ]; do
+  sleep 5
+done
+
+echo "== 2. Swap de 2 GB (t3.micro solo tiene 1 GB de RAM y la compilacion necesita mas) =="
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+fi
+
+echo "== 3. Nginx, Git y Node.js 22 desde el repositorio firmado de NodeSource =="
+apt-get update
+apt-get install -y nginx git gnupg
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+apt-get update
+apt-get install -y nodejs
+
+echo "== 4. Codigo y compilacion con la URL del backend =="
+git clone --depth 1 ${repo_url} /opt/control-asistencia
+cd /opt/control-asistencia/frontend
+npm ci
+VITE_GRAPHQL_URL=http://${backend_ip}/graphql/ npm run build
+
+echo "== 5. Publicar con Nginx =="
+mkdir -p /var/www/control-asistencia
+cp -r dist/. /var/www/control-asistencia/
+
+cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/control-asistencia;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+EOF
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+nginx -t
+systemctl reload nginx
+
+echo "== Frontend listo =="

@@ -20,3 +20,9 @@ variable "ruta_clave_publica" {
   type        = string
   default     = "~/.ssh/control-asistencia.pub"
 }
+
+variable "repo_url" {
+  description = "URL HTTPS del repositorio publico con el codigo"
+  type        = string
+  default     = "https://github.com/antounie/control-asistencia-iac.git"
+}

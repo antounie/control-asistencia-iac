@@ -1,0 +1,108 @@
+#!/bin/bash
+# Script de arranque del BACKEND. Lo ejecuta cloud-init como root, una sola vez.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export HOME=/root
+cd /tmp
+
+APP_DIR=/opt/control-asistencia
+ENV_FILE=/etc/control-asistencia/backend.env
+
+echo "== 1. Esperando a que la IP elastica quede asociada =="
+until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${backend_ip}" ]; do
+  sleep 5
+done
+
+echo "== 2. Paquetes del sistema =="
+apt-get update
+apt-get install -y python3-venv postgresql nginx git
+
+echo "== 3. Usuario de servicio sin privilegios y codigo =="
+useradd --system --create-home --home-dir $APP_DIR --shell /usr/sbin/nologin asistencia
+chmod 755 $APP_DIR
+git clone --depth 1 ${repo_url} $APP_DIR/app
+
+echo "== 4. Secretos generados dentro del servidor =="
+DB_PASSWORD=$(openssl rand -hex 24)
+DJANGO_SECRET_KEY=$(openssl rand -hex 32)
+mkdir -p /etc/control-asistencia
+umask 077
+cat > $ENV_FILE <<EOF
+DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
+DB_PASSWORD=$DB_PASSWORD
+DB_NAME=asist
+DB_USER=asist
+DJANGO_ALLOWED_HOSTS=${backend_ip},localhost,127.0.0.1
+DJANGO_CORS_ORIGINS=http://${frontend_ip}
+EOF
+umask 022
+
+echo "== 5. PostgreSQL (solo escucha en localhost) =="
+sudo -u postgres psql -c "CREATE USER asist WITH PASSWORD '$DB_PASSWORD';"
+sudo -u postgres psql -c "CREATE DATABASE asist OWNER asist;"
+
+echo "== 6. Entorno de Python y dependencias =="
+python3 -m venv $APP_DIR/venv
+$APP_DIR/venv/bin/pip install -r $APP_DIR/app/backend/requirements.txt
+
+echo "== 7. Comando de administracion con las variables cargadas =="
+cat > /usr/local/bin/asistencia-manage <<'EOF'
+#!/bin/bash
+set -a
+. /etc/control-asistencia/backend.env
+set +a
+cd /opt/control-asistencia/app/backend
+exec /opt/control-asistencia/venv/bin/python manage.py "$@"
+EOF
+chmod 750 /usr/local/bin/asistencia-manage
+
+/usr/local/bin/asistencia-manage migrate --noinput
+/usr/local/bin/asistencia-manage collectstatic --noinput
+chown -R asistencia:asistencia $APP_DIR
+
+echo "== 8. Servicio Gunicorn =="
+cat > /etc/systemd/system/gunicorn-asistencia.service <<'EOF'
+[Unit]
+Description=Gunicorn - Control de Asistencia
+After=network.target postgresql.service
+
+[Service]
+User=asistencia
+Group=asistencia
+WorkingDirectory=/opt/control-asistencia/app/backend
+EnvironmentFile=/etc/control-asistencia/backend.env
+ExecStart=/opt/control-asistencia/venv/bin/gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 2
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now gunicorn-asistencia
+
+echo "== 9. Nginx como proxy inverso =="
+cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    client_max_body_size 10m;
+
+    location /static/ {
+        alias /opt/control-asistencia/app/backend/staticfiles/;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+EOF
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+nginx -t
+systemctl reload nginx
+
+echo "== Backend listo =="
