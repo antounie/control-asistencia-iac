@@ -29,12 +29,16 @@ Parameters:
     Description: Contenido del archivo control-asistencia.pub (solo la clave PUBLICA)
 
   VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: ID de la VPC por defecto de us-east-2
+    Type: String
+    AllowedPattern: '^vpc-[0-9a-f]{8,17}$'
+    ConstraintDescription: Debe ser un ID de VPC, por ejemplo vpc-0123456789abcdef0
+    Description: ID de la VPC por defecto de us-east-2 (la base comprueba que exista)
 
   AmiId:
-    Type: AWS::EC2::Image::Id
-    Description: AMI de Ubuntu 24.04 fijada a proposito (cambiarla reemplaza los servidores)
+    Type: String
+    AllowedPattern: '^ami-[0-9a-f]{8,17}$'
+    ConstraintDescription: Debe ser un ID de AMI, por ejemplo ami-0123456789abcdef0
+    Description: AMI de Ubuntu 24.04 fijada a proposito (el servidor comprueba que exista)
 
   TipoInstancia:
     Type: String
