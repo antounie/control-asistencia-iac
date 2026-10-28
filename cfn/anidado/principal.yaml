@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Control de asistencia: stack padre que une la base y los dos servidores (Practico 6, stacks anidados)"
+
+# =====================================================================
+# PARAMETROS: la unica puerta de entrada de datos; aqui se validan
+# =====================================================================
+Parameters:
+  Proyecto:
+    Type: String
+    Default: control-asistencia
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Nombre del proyecto en minusculas, usado en etiquetas y nombres
+
+  RepoUrl:
+    Type: String
+    Default: https://github.com/antounie/control-asistencia-iac.git
+    Description: URL HTTPS del repositorio publico con el codigo
+
+  MiIP:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/32$'
+    ConstraintDescription: Debe ser una sola IP con mascara /32, por ejemplo 203.0.113.10/32
+    Description: IP publica con mascara /32 autorizada para SSH
+
+  ClavePublica:
+    Type: String
+    AllowedPattern: '^ssh-ed25519 AAAA[0-9A-Za-z+/=]+( .*)?$'
+    ConstraintDescription: Debe ser una clave publica ed25519 que empiece con ssh-ed25519 AAAA
+    Description: Contenido del archivo control-asistencia.pub (solo la clave PUBLICA)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID de la VPC por defecto de us-east-2
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI de Ubuntu 24.04 fijada a proposito (cambiarla reemplaza los servidores)
+
+  TipoInstancia:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: Tipo de instancia para ambos servidores (limitado para controlar costos)
+
+  BucketPlantillas:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Bucket S3 privado donde estan base.yaml y servidor.yaml
+
+# =====================================================================
+# RECURSOS: tres stacks hijos; el orden sale de los GetAtt
+# =====================================================================
+Resources:
+
+  # ---------- Hijo 1: lo compartido (claves, Security Groups, IP elasticas) ----------
+  Base:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${BucketPlantillas}.s3.${AWS::Region}.amazonaws.com/base.yaml"
+      Parameters:
+        Proyecto: !Ref Proyecto
+        MiIP: !Ref MiIP
+        ClavePublica: !Ref ClavePublica
+        VpcId: !Ref VpcId
+
+  # ---------- Hijo 2: servidor.yaml usado como BACKEND ----------
+  ServidorBackend:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${BucketPlantillas}.s3.${AWS::Region}.amazonaws.com/servidor.yaml"
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Rol: backend
+        AmiId: !Ref AmiId
+        TipoInstancia: !Ref TipoInstancia
+        RepoUrl: !Ref RepoUrl
+        NombreClave: !GetAtt Base.Outputs.NombreClave
+        SecurityGroupId: !GetAtt Base.Outputs.SgBackendId
+        EipAllocationId: !GetAtt Base.Outputs.EipBackendAllocationId
+        BackendIp: !GetAtt Base.Outputs.EipBackendIp
+        FrontendIp: !GetAtt Base.Outputs.EipFrontendIp
+
+  # ---------- Hijo 3: la MISMA plantilla usada como FRONTEND ----------
+  ServidorFrontend:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${BucketPlantillas}.s3.${AWS::Region}.amazonaws.com/servidor.yaml"
+      Parameters:
+        Proyecto: !Ref Proyecto
+        Rol: frontend
+        AmiId: !Ref AmiId
+        TipoInstancia: !Ref TipoInstancia
+        RepoUrl: !Ref RepoUrl
+        NombreClave: !GetAtt Base.Outputs.NombreClave
+        SecurityGroupId: !GetAtt Base.Outputs.SgFrontendId
+        EipAllocationId: !GetAtt Base.Outputs.EipFrontendAllocationId
+        BackendIp: !GetAtt Base.Outputs.EipBackendIp
+        FrontendIp: !GetAtt Base.Outputs.EipFrontendIp
+
+# =====================================================================
+# SALIDAS: las mismas 5 del Practico 5, leidas desde la base
+# =====================================================================
+Outputs:
+  FrontendUrl:
+    Description: Direccion del frontend
+    Value: !Sub
+      - "http://${Ip}"
+      - Ip: !GetAtt Base.Outputs.EipFrontendIp
+
+  BackendGraphqlUrl:
+    Description: API GraphQL del backend
+    Value: !Sub
+      - "http://${Ip}/graphql/"
+      - Ip: !GetAtt Base.Outputs.EipBackendIp
+
+  BackendAdminUrl:
+    Description: Panel de administracion de Django
+    Value: !Sub
+      - "http://${Ip}/admin/"
+      - Ip: !GetAtt Base.Outputs.EipBackendIp
+
+  SshBackend:
+    Description: Comando para entrar al backend por SSH
+    Value: !Sub
+      - "ssh -i $HOME/.ssh/control-asistencia ubuntu@${Ip}"
+      - Ip: !GetAtt Base.Outputs.EipBackendIp
+
+  SshFrontend:
+    Description: Comando para entrar al frontend por SSH
+    Value: !Sub
+      - "ssh -i $HOME/.ssh/control-asistencia ubuntu@${Ip}"
+      - Ip: !GetAtt Base.Outputs.EipFrontendIp

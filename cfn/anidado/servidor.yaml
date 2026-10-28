@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Servidor reutilizable: una instancia EC2 con su IP elastica (stack hijo, se usa 2 veces)"
+
+Parameters:
+  Proyecto:
+    Type: String
+    Description: Nombre del proyecto, usado en etiquetas
+
+  Rol:
+    Type: String
+    AllowedValues:
+      - frontend
+      - backend
+    Description: Que servidor se crea; decide el nombre y el script de arranque
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI de Ubuntu 24.04 (fijada en el padre)
+
+  TipoInstancia:
+    Type: String
+    Description: Tipo de instancia EC2
+
+  NombreClave:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Nombre del par de claves SSH creado en la base
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID del Security Group de este servidor
+
+  EipAllocationId:
+    Type: String
+    Description: ID de asignacion de la IP elastica de este servidor
+
+  BackendIp:
+    Type: String
+    Description: IP elastica del backend (la usan ambos scripts)
+
+  FrontendIp:
+    Type: String
+    Description: IP elastica del frontend (la usan ambos scripts)
+
+  RepoUrl:
+    Type: String
+    Description: URL HTTPS del repositorio publico con el codigo
+
+Conditions:
+  EsBackend: !Equals [!Ref Rol, backend]
+
+Resources:
+  Instancia:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref NombreClave
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-${Rol}"
+      UserData:
+        Fn::Base64: !If
+          - EsBackend
+          - !Sub |
+            #!/bin/bash
+            # Script de arranque del BACKEND. Lo ejecuta cloud-init como root, una sola vez.
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            export HOME=/root
+            cd /tmp
+
+            APP_DIR=/opt/control-asistencia
+            ENV_FILE=/etc/control-asistencia/backend.env
+
+            echo "== 1. Esperando a que la IP elastica quede asociada =="
+            until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${BackendIp}" ]; do
+              sleep 5
+            done
+
+            echo "== 2. Paquetes del sistema =="
+            apt-get update
+            apt-get install -y python3-venv postgresql nginx git
+
+            echo "== 3. Usuario de servicio sin privilegios y codigo =="
+            useradd --system --create-home --home-dir $APP_DIR --shell /usr/sbin/nologin asistencia
+            chmod 755 $APP_DIR
+            git clone --depth 1 ${RepoUrl} $APP_DIR/app
+
+            echo "== 4. Secretos generados dentro del servidor =="
+            DB_PASSWORD=$(openssl rand -hex 24)
+            DJANGO_SECRET_KEY=$(openssl rand -hex 32)
+            mkdir -p /etc/control-asistencia
+            umask 077
+            cat > $ENV_FILE <<EOF
+            DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
+            DB_PASSWORD=$DB_PASSWORD
+            DB_NAME=asist
+            DB_USER=asist
+            DJANGO_ALLOWED_HOSTS=${BackendIp},localhost,127.0.0.1
+            DJANGO_CORS_ORIGINS=http://${FrontendIp}
+            EOF
+            umask 022
+
+            echo "== 5. PostgreSQL (solo escucha en localhost) =="
+            sudo -u postgres psql -c "CREATE USER asist WITH PASSWORD '$DB_PASSWORD';"
+            sudo -u postgres psql -c "CREATE DATABASE asist OWNER asist;"
+
+            echo "== 6. Entorno de Python y dependencias =="
+            python3 -m venv $APP_DIR/venv
+            $APP_DIR/venv/bin/pip install -r $APP_DIR/app/backend/requirements.txt
+
+            echo "== 7. Comando de administracion con las variables cargadas =="
+            cat > /usr/local/bin/asistencia-manage <<'EOF'
+            #!/bin/bash
+            set -a
+            . /etc/control-asistencia/backend.env
+            set +a
+            cd /opt/control-asistencia/app/backend
+            exec /opt/control-asistencia/venv/bin/python manage.py "$@"
+            EOF
+            chmod 750 /usr/local/bin/asistencia-manage
+
+            /usr/local/bin/asistencia-manage migrate --noinput
+            /usr/local/bin/asistencia-manage collectstatic --noinput
+            chown -R asistencia:asistencia $APP_DIR
+
+            echo "== 8. Servicio Gunicorn =="
+            cat > /etc/systemd/system/gunicorn-asistencia.service <<'EOF'
+            [Unit]
+            Description=Gunicorn - Control de Asistencia
+            After=network.target postgresql.service
+
+            [Service]
+            User=asistencia
+            Group=asistencia
+            WorkingDirectory=/opt/control-asistencia/app/backend
+            EnvironmentFile=/etc/control-asistencia/backend.env
+            ExecStart=/opt/control-asistencia/venv/bin/gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 2
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now gunicorn-asistencia
+
+            echo "== 9. Nginx como proxy inverso =="
+            cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+            server {
+                listen 80 default_server;
+                server_name _;
+                client_max_body_size 10m;
+
+                location /static/ {
+                    alias /opt/control-asistencia/app/backend/staticfiles/;
+                }
+
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+            nginx -t
+            systemctl reload nginx
+
+            echo "== Backend listo =="
+          - !Sub |
+            #!/bin/bash
+            # Script de arranque del FRONTEND. Lo ejecuta cloud-init como root, una sola vez.
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            export HOME=/root
+            cd /tmp
+
+            echo "== 1. Esperando a que la IP elastica quede asociada =="
+            until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${FrontendIp}" ]; do
+              sleep 5
+            done
+
+            echo "== 2. Swap de 2 GB (t3.micro solo tiene 1 GB de RAM y la compilacion necesita mas) =="
+            if [ ! -f /swapfile ]; then
+              fallocate -l 2G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile
+              swapon /swapfile
+            fi
+
+            echo "== 3. Nginx, Git y Node.js 22 desde el repositorio firmado de NodeSource =="
+            apt-get update
+            apt-get install -y nginx git gnupg
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+            apt-get update
+            apt-get install -y nodejs
+
+            echo "== 4. Codigo y compilacion con la URL del backend =="
+            git clone --depth 1 ${RepoUrl} /opt/control-asistencia
+            cd /opt/control-asistencia/frontend
+            npm ci
+            VITE_GRAPHQL_URL=http://${BackendIp}/graphql/ npm run build
+
+            echo "== 5. Publicar con Nginx =="
+            mkdir -p /var/www/control-asistencia
+            cp -r dist/. /var/www/control-asistencia/
+
+            cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+            server {
+                listen 80 default_server;
+                server_name _;
+                root /var/www/control-asistencia;
+                index index.html;
+
+                location / {
+                    try_files $uri $uri/ /index.html;
+                }
+            }
+            EOF
+            rm -f /etc/nginx/sites-enabled/default
+            ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+            nginx -t
+            systemctl reload nginx
+
+            echo "== Frontend listo =="
+
+  AsociacionEip:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !Ref EipAllocationId
+      InstanceId: !Ref Instancia
+
+Outputs:
+  InstanciaId:
+    Description: ID de la instancia creada
+    Value: !Ref Instancia

@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Base compartida: par de claves, Security Groups e IP elasticas (stack hijo)"
+
+Parameters:
+  Proyecto:
+    Type: String
+    Description: Nombre del proyecto, usado en etiquetas y nombres de recursos
+
+  MiIP:
+    Type: String
+    Description: IP con mascara /32 autorizada para SSH (se valida en el padre)
+
+  ClavePublica:
+    Type: String
+    Description: Contenido de la clave publica SSH (se valida en el padre)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID de la VPC donde se crean los Security Groups
+
+Resources:
+
+
+  ClaveSsh:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${Proyecto}-key"
+      PublicKeyMaterial: !Ref ClavePublica
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-key"
+
+  # ---------- Security Group del frontend ----------
+  SgFrontend:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: El puerto 80 debe ser publico porque el navegador accede a la aplicacion
+    Properties:
+      GroupDescription: HTTP publico y SSH desde mi IP para el frontend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP desde internet
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIP
+          Description: SSH desde mi IP
+      SecurityGroupEgress:
+        # trivy:ignore:AWS-0104 Salida HTTP necesaria para los repositorios de Ubuntu
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTP para repositorios de paquetes
+        # trivy:ignore:AWS-0104 Salida HTTPS necesaria para GitHub, PyPI, npm y NodeSource
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTPS para GitHub, PyPI, npm y NodeSource
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-frontend-sg"
+
+  # ---------- Security Group del backend ----------
+  SgBackend:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: El puerto 80 debe ser publico porque el navegador accede a la aplicacion
+    Properties:
+      GroupDescription: HTTP publico y SSH desde mi IP para el backend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP desde internet
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIP
+          Description: SSH desde mi IP
+      SecurityGroupEgress:
+        # trivy:ignore:AWS-0104 Salida HTTP necesaria para los repositorios de Ubuntu
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTP para repositorios de paquetes
+        # trivy:ignore:AWS-0104 Salida HTTPS necesaria para GitHub, PyPI, npm y NodeSource
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTPS para GitHub, PyPI, npm y NodeSource
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-backend-sg"
+
+  # ---------- IP elasticas (se crean antes que las instancias) ----------
+  EipBackend:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-backend-eip"
+
+  EipFrontend:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-frontend-eip"
+
+
+
+
+Outputs:
+  NombreClave:
+    Description: Nombre del par de claves SSH
+    Value: !Ref ClaveSsh
+
+  SgFrontendId:
+    Description: ID del Security Group del frontend
+    Value: !GetAtt SgFrontend.GroupId
+
+  SgBackendId:
+    Description: ID del Security Group del backend
+    Value: !GetAtt SgBackend.GroupId
+
+  EipFrontendIp:
+    Description: IP elastica del frontend
+    Value: !GetAtt EipFrontend.PublicIp
+
+  EipBackendIp:
+    Description: IP elastica del backend
+    Value: !GetAtt EipBackend.PublicIp
+
+  EipFrontendAllocationId:
+    Description: ID de asignacion de la IP elastica del frontend
+    Value: !GetAtt EipFrontend.AllocationId
+
+  EipBackendAllocationId:
+    Description: ID de asignacion de la IP elastica del backend
+    Value: !GetAtt EipBackend.AllocationId
