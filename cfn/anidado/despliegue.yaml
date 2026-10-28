@@ -1,0 +1,16 @@
+# Archivo de despliegue de Git sync. CloudFormation lo vigila junto con principal.yaml:
+# cualquier commit que lo cambie en la rama main actualiza el stack control-asistencia.
+template-file-path: cfn/anidado/principal.yaml
+
+parameters:
+  BucketPlantillas: control-asistencia-plantillas-m6zkaj1p
+  VpcId: vpc-003b74642d37081fb
+  AmiId: ami-0fc53b217ec1ad816
+  TipoInstancia: t3.micro
+  MiIP: "TU_IP/32"
+  ClavePublica: "ssh-ed25519 AAAA...tu-clave... antonio-iac-lab"
+
+tags:
+  Proyecto: control-asistencia
+  Entorno: laboratorio
+  Gestion: cloudformation-git-sync
