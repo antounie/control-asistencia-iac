@@ -32,3 +32,6 @@ crash.log
 # Secretos y claves
 .env
 *.pem
+
+# CloudFormation (valores reales de parametros)
+cfn/parametros.json

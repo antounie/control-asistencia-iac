@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Control de asistencia: frontend y backend en EC2 con IP elasticas (Practico 5, Modulo 2 IaC)"
+
+# =====================================================================
+# PARAMETROS: datos de entrada (equivalen a variables.tf)
+# =====================================================================
+Parameters:
+  Proyecto:
+    Type: String
+    Default: control-asistencia
+    Description: Nombre del proyecto, usado en etiquetas y nombres de recursos
+
+  RepoUrl:
+    Type: String
+    Default: https://github.com/antounie/control-asistencia-iac.git
+    Description: URL HTTPS del repositorio publico con el codigo (se clona sin credenciales)
+
+  MiIP:
+    Type: String
+    Description: Mi IP publica con mascara /32 para permitir SSH, por ejemplo 203.0.113.10/32
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/32$'
+    ConstraintDescription: Debe ser una sola IP con mascara /32, por ejemplo 203.0.113.10/32
+
+  ClavePublica:
+    Type: String
+    Description: Contenido del archivo control-asistencia.pub (solo la clave PUBLICA)
+    AllowedPattern: '^ssh-ed25519 AAAA[0-9A-Za-z+/=]+( .*)?$'
+    ConstraintDescription: Debe ser una clave publica ed25519 que empiece con ssh-ed25519 AAAA
+
+  VpcId:
+    # Reemplaza al data "aws_vpc" "default": el tipo especial valida que la VPC exista
+    Type: AWS::EC2::VPC::Id
+    Description: ID de la VPC por defecto de us-east-2
+
+  AmiUbuntu:
+    # Reemplaza al data "aws_ami": lee el parametro publico que mantiene Canonical
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Parametro publico de SSM con la AMI oficial mas reciente de Ubuntu 24.04
+
+  TipoInstancia:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: Tipo de instancia para ambos servidores (limitado para controlar costos)
+
+# =====================================================================
+# RECURSOS: lo que se crea (equivalen a network.tf y ec2.tf)
+# =====================================================================
+Resources:
+
+  # ---------- Par de claves SSH (solo se sube la clave publica) ----------
+  ClaveSsh:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${Proyecto}-key"
+      PublicKeyMaterial: !Ref ClavePublica
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-key"
+
+  # ---------- Security Group del frontend ----------
+  SgFrontend:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: El puerto 80 debe ser publico porque el navegador accede a la aplicacion
+    Properties:
+      GroupDescription: HTTP publico y SSH desde mi IP para el frontend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP desde internet
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIP
+          Description: SSH desde mi IP
+      SecurityGroupEgress:
+        # trivy:ignore:AWS-0104 Salida HTTP necesaria para los repositorios de Ubuntu
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTP para repositorios de paquetes
+        # trivy:ignore:AWS-0104 Salida HTTPS necesaria para GitHub, PyPI, npm y NodeSource
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTPS para GitHub, PyPI, npm y NodeSource
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-frontend-sg"
+
+  # ---------- Security Group del backend ----------
+  SgBackend:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_260
+            comment: El puerto 80 debe ser publico porque el navegador accede a la aplicacion
+    Properties:
+      GroupDescription: HTTP publico y SSH desde mi IP para el backend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP desde internet
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MiIP
+          Description: SSH desde mi IP
+      SecurityGroupEgress:
+        # trivy:ignore:AWS-0104 Salida HTTP necesaria para los repositorios de Ubuntu
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTP para repositorios de paquetes
+        # trivy:ignore:AWS-0104 Salida HTTPS necesaria para GitHub, PyPI, npm y NodeSource
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Salida HTTPS para GitHub, PyPI, npm y NodeSource
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-backend-sg"
+
+  # ---------- IP elasticas (se crean antes que las instancias) ----------
+  EipBackend:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-backend-eip"
+
+  EipFrontend:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-frontend-eip"
+
+  # ---------- Instancia del backend ----------
+  InstanciaBackend:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiUbuntu
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref ClaveSsh
+      SecurityGroupIds:
+        # GetAtt GroupId devuelve siempre el ID (sg-...), que es lo que pide esta propiedad
+        - !GetAtt SgBackend.GroupId
+      BlockDeviceMappings:
+        # /dev/sda1 es el disco raiz en las AMI de Ubuntu; otro nombre crearia un disco extra
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        # IMDSv2 obligatorio: equivale a http_tokens = "required" en Terraform
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-backend"
+      # Fn::Sub reemplaza ${EipBackend.PublicIp}, ${EipFrontend.PublicIp} y ${RepoUrl};
+      # las variables de Bash sin llaves ($APP_DIR, $host) quedan intactas.
+      # Fn::Base64 codifica el script, como exige EC2 para el UserData.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Script de arranque del BACKEND. Lo ejecuta cloud-init como root, una sola vez.
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export HOME=/root
+          cd /tmp
+
+          APP_DIR=/opt/control-asistencia
+          ENV_FILE=/etc/control-asistencia/backend.env
+
+          echo "== 1. Esperando a que la IP elastica quede asociada =="
+          until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${EipBackend.PublicIp}" ]; do
+            sleep 5
+          done
+
+          echo "== 2. Paquetes del sistema =="
+          apt-get update
+          apt-get install -y python3-venv postgresql nginx git
+
+          echo "== 3. Usuario de servicio sin privilegios y codigo =="
+          useradd --system --create-home --home-dir $APP_DIR --shell /usr/sbin/nologin asistencia
+          chmod 755 $APP_DIR
+          git clone --depth 1 ${RepoUrl} $APP_DIR/app
+
+          echo "== 4. Secretos generados dentro del servidor =="
+          DB_PASSWORD=$(openssl rand -hex 24)
+          DJANGO_SECRET_KEY=$(openssl rand -hex 32)
+          mkdir -p /etc/control-asistencia
+          umask 077
+          cat > $ENV_FILE <<EOF
+          DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
+          DB_PASSWORD=$DB_PASSWORD
+          DB_NAME=asist
+          DB_USER=asist
+          DJANGO_ALLOWED_HOSTS=${EipBackend.PublicIp},localhost,127.0.0.1
+          DJANGO_CORS_ORIGINS=http://${EipFrontend.PublicIp}
+          EOF
+          umask 022
+
+          echo "== 5. PostgreSQL (solo escucha en localhost) =="
+          sudo -u postgres psql -c "CREATE USER asist WITH PASSWORD '$DB_PASSWORD';"
+          sudo -u postgres psql -c "CREATE DATABASE asist OWNER asist;"
+
+          echo "== 6. Entorno de Python y dependencias =="
+          python3 -m venv $APP_DIR/venv
+          $APP_DIR/venv/bin/pip install -r $APP_DIR/app/backend/requirements.txt
+
+          echo "== 7. Comando de administracion con las variables cargadas =="
+          cat > /usr/local/bin/asistencia-manage <<'EOF'
+          #!/bin/bash
+          set -a
+          . /etc/control-asistencia/backend.env
+          set +a
+          cd /opt/control-asistencia/app/backend
+          exec /opt/control-asistencia/venv/bin/python manage.py "$@"
+          EOF
+          chmod 750 /usr/local/bin/asistencia-manage
+
+          /usr/local/bin/asistencia-manage migrate --noinput
+          /usr/local/bin/asistencia-manage collectstatic --noinput
+          chown -R asistencia:asistencia $APP_DIR
+
+          echo "== 8. Servicio Gunicorn =="
+          cat > /etc/systemd/system/gunicorn-asistencia.service <<'EOF'
+          [Unit]
+          Description=Gunicorn - Control de Asistencia
+          After=network.target postgresql.service
+
+          [Service]
+          User=asistencia
+          Group=asistencia
+          WorkingDirectory=/opt/control-asistencia/app/backend
+          EnvironmentFile=/etc/control-asistencia/backend.env
+          ExecStart=/opt/control-asistencia/venv/bin/gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 2
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now gunicorn-asistencia
+
+          echo "== 9. Nginx como proxy inverso =="
+          cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+          server {
+              listen 80 default_server;
+              server_name _;
+              client_max_body_size 10m;
+
+              location /static/ {
+                  alias /opt/control-asistencia/app/backend/staticfiles/;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          EOF
+          rm -f /etc/nginx/sites-enabled/default
+          ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+          nginx -t
+          systemctl reload nginx
+
+          echo "== Backend listo =="
+
+  # ---------- Instancia del frontend ----------
+  InstanciaFrontend:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiUbuntu
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref ClaveSsh
+      SecurityGroupIds:
+        - !GetAtt SgFrontend.GroupId
+      BlockDeviceMappings:
+        # /dev/sda1 es el disco raiz en las AMI de Ubuntu; otro nombre crearia un disco extra
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        # IMDSv2 obligatorio: equivale a http_tokens = "required" en Terraform
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${Proyecto}-frontend"
+      # Fn::Sub reemplaza ${EipBackend.PublicIp}, ${EipFrontend.PublicIp} y ${RepoUrl};
+      # las variables de Bash sin llaves ($APP_DIR, $host) quedan intactas.
+      # Fn::Base64 codifica el script, como exige EC2 para el UserData.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Script de arranque del FRONTEND. Lo ejecuta cloud-init como root, una sola vez.
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export HOME=/root
+          cd /tmp
+
+          echo "== 1. Esperando a que la IP elastica quede asociada =="
+          until [ "$(curl -s --max-time 5 https://checkip.amazonaws.com)" = "${EipFrontend.PublicIp}" ]; do
+            sleep 5
+          done
+
+          echo "== 2. Swap de 2 GB (t3.micro solo tiene 1 GB de RAM y la compilacion necesita mas) =="
+          if [ ! -f /swapfile ]; then
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+          fi
+
+          echo "== 3. Nginx, Git y Node.js 22 desde el repositorio firmado de NodeSource =="
+          apt-get update
+          apt-get install -y nginx git gnupg
+          mkdir -p /etc/apt/keyrings
+          curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+          apt-get update
+          apt-get install -y nodejs
+
+          echo "== 4. Codigo y compilacion con la URL del backend =="
+          git clone --depth 1 ${RepoUrl} /opt/control-asistencia
+          cd /opt/control-asistencia/frontend
+          npm ci
+          VITE_GRAPHQL_URL=http://${EipBackend.PublicIp}/graphql/ npm run build
+
+          echo "== 5. Publicar con Nginx =="
+          mkdir -p /var/www/control-asistencia
+          cp -r dist/. /var/www/control-asistencia/
+
+          cat > /etc/nginx/sites-available/control-asistencia <<'EOF'
+          server {
+              listen 80 default_server;
+              server_name _;
+              root /var/www/control-asistencia;
+              index index.html;
+
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+          }
+          EOF
+          rm -f /etc/nginx/sites-enabled/default
+          ln -sf /etc/nginx/sites-available/control-asistencia /etc/nginx/sites-enabled/control-asistencia
+          nginx -t
+          systemctl reload nginx
+
+          echo "== Frontend listo =="
+
+  # ---------- Asociar cada IP elastica a su instancia ----------
+  AsociacionEipBackend:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EipBackend.AllocationId
+      InstanceId: !Ref InstanciaBackend
+
+  AsociacionEipFrontend:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EipFrontend.AllocationId
+      InstanceId: !Ref InstanciaFrontend
+
+# =====================================================================
+# SALIDAS: datos utiles despues del despliegue (equivalen a outputs.tf)
+# =====================================================================
+Outputs:
+  FrontendUrl:
+    Description: Direccion del frontend
+    Value: !Sub "http://${EipFrontend.PublicIp}"
+
+  BackendGraphqlUrl:
+    Description: API GraphQL del backend
+    Value: !Sub "http://${EipBackend.PublicIp}/graphql/"
+
+  BackendAdminUrl:
+    Description: Panel de administracion de Django
+    Value: !Sub "http://${EipBackend.PublicIp}/admin/"
+
+  SshBackend:
+    Description: Comando para entrar al backend por SSH
+    Value: !Sub "ssh -i $HOME/.ssh/control-asistencia ubuntu@${EipBackend.PublicIp}"
+
+  SshFrontend:
+    Description: Comando para entrar al frontend por SSH
+    Value: !Sub "ssh -i $HOME/.ssh/control-asistencia ubuntu@${EipFrontend.PublicIp}"

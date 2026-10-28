@@ -1,0 +1,5 @@
+[
+  { "ParameterKey": "MiIP",         "ParameterValue": "203.0.113.10/32" },
+  { "ParameterKey": "ClavePublica", "ParameterValue": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReemplazarConTuClavePublica usuario@pc" },
+  { "ParameterKey": "VpcId",        "ParameterValue": "vpc-0123456789abcdef0" }
+]
