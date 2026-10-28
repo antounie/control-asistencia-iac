@@ -7,8 +7,8 @@ parameters:
   VpcId: vpc-003b74642d37081fb
   AmiId: ami-0fc53b217ec1ad816
   TipoInstancia: t3.micro
-  MiIP: "TU_IP/32"
-  ClavePublica: "ssh-ed25519 AAAA...tu-clave... antonio-iac-lab"
+  MiIP: "166.114.166.97/32"
+  ClavePublica: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBvHDHlsf+NMq9oiORBPXfUcWNJS2PRtJZM6xElFJs3v antonio-iac-lab"
 
 tags:
   Proyecto: control-asistencia
